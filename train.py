@@ -1,52 +1,156 @@
-# Plant Disease Classifier
+import os
+import kagglehub
+import tensorflow as tf
+from tensorflow.keras import layers
+import numpy as np
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-A MobileNetV2 transfer-learning image classifier that identifies plant
-diseases from leaf photos across 38 classes spanning 14 crop species,
-trained on the PlantVillage dataset.
+path = kagglehub.dataset_download('abdallahalidev/plantvillage-dataset')
+data_dir = os.path.join(path, 'plantvillage dataset', 'color')
 
-## Approach
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 16
+AUTOTUNE = tf.data.AUTOTUNE
 
-- **Backbone**: MobileNetV2 pretrained on ImageNet, frozen initially
-- **Head**: `GlobalAveragePooling2D → Dropout(0.2) → Dense(128, relu) → Dense(38, softmax)`
-- **Pipeline**: `tf.data` with on-the-fly augmentation (flip, rotation, zoom)
-  applied only to training data, never validation
-- **Fine-tuning**: top ~55 layers of MobileNetV2 unfrozen after head training,
-  retrained with a reduced learning rate (1e-5)
+train_ds_raw = tf.keras.utils.image_dataset_from_directory(
+    data_dir,
+    validation_split=0.2,
+    subset="training",
+    seed=123,
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    color_mode='rgb'
+)
 
-## Results
+valid_ds_raw = tf.keras.utils.image_dataset_from_directory(
+    data_dir,
+    validation_split=0.2,
+    subset="validation",
+    seed=123,
+    image_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    color_mode='rgb'
+)
 
-- **89% validation accuracy** after initial head training
-- Strong performance on visually distinct classes (e.g. `Grape___healthy`,
-  `Squash___Powdery_mildew`, both near 0.99 f1-score)
-- **Key finding**: tomato disease classes were the model's weakest area
-  (`Tomato___Early_blight` recall as low as 0.13, several others under 0.75
-  f1-score). Confusion matrix analysis shows these classes are being
-  confused with each other rather than with unrelated crop diseases —
-  consistent with the fact that early blight, Septoria leaf spot, and
-  target spot all present similarly on tomato leaves (brownish/dark
-  lesions), making them genuinely hard to distinguish even visually.
+class_names = train_ds_raw.class_names
+num_classes = len(class_names)
 
-## Dataset
+data_augment = tf.keras.Sequential([
+    layers.RandomFlip('horizontal'),
+    layers.RandomRotation(0.2),
+    layers.RandomZoom(0.2),
+])
+normalize = layers.Rescaling(1./255)
 
-[PlantVillage Dataset on Kaggle](https://www.kaggle.com/datasets/abdallahalidev/plantvillage-dataset)
-(not included in this repo — downloaded via `kagglehub` at runtime)
+def prepare_train(x, y):
+    x = data_augment(x, training=True)
+    x = normalize(x)
+    return x, y
 
-## Requirements
+def prepare_valid(x, y):
+    x = normalize(x)
+    return x, y
 
-```bash
-pip install tensorflow kagglehub scikit-learn matplotlib seaborn numpy
-```
+train_ds = (
+    train_ds_raw
+    .map(prepare_train, num_parallel_calls=AUTOTUNE)
+    .shuffle(200)
+    .prefetch(AUTOTUNE)
+)
 
-## Usage
+valid_ds = (
+    valid_ds_raw
+    .map(prepare_valid, num_parallel_calls=AUTOTUNE)
+    .prefetch(AUTOTUNE)
+)
 
-```bash
-python train.py
-```
+base_model = tf.keras.applications.MobileNetV2(
+    input_shape=(224, 224, 3),
+    include_top=False,
+    weights='imagenet'
+)
+base_model.trainable = False
 
-## What I'd Improve With More Time
+model = tf.keras.Sequential([
+    base_model,
+    layers.GlobalAveragePooling2D(),
+    layers.Dropout(0.2),
+    layers.Dense(128, activation='relu'),
+    layers.Dense(num_classes, activation='softmax')
+])
 
-- Targeted data augmentation or class-weighting specifically for the
-  weak tomato classes
-- A second-stage classifier specialized only on tomato diseases, given
-  how visually distinct they are from other crops but similar to each other
-- Deploy as an interactive demo (Gradio / Hugging Face Spaces) for live testing
+model.compile(
+    optimizer='adam',
+    loss='sparse_categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+checkpoint = tf.keras.callbacks.ModelCheckpoint(
+    'plant_model.keras',
+    monitor='val_accuracy',
+    save_best_only=True,
+    verbose=1
+)
+
+early_stop = tf.keras.callbacks.EarlyStopping(
+    monitor='val_accuracy',
+    patience=3,
+    restore_best_weights=True
+)
+
+model.fit(
+    train_ds,
+    epochs=10,
+    validation_data=valid_ds,
+    callbacks=[checkpoint, early_stop],
+    verbose=1
+)
+
+model.save('plant_model.keras')
+
+base_model.trainable = True
+fine_tune_at = 100
+for layer in base_model.layers[:fine_tune_at]:
+    layer.trainable = False
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
+    loss='sparse_categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+model.fit(
+    train_ds,
+    epochs=20,
+    initial_epoch=10,
+    validation_data=valid_ds,
+    callbacks=[checkpoint, early_stop],
+    verbose=1
+)
+
+model.save('plant_model_finetuned.keras')
+
+y_true = []
+y_pred = []
+for images, labels in valid_ds:
+    preds = model.predict(images, verbose=0)
+    y_true.extend(labels.numpy())
+    y_pred.extend(np.argmax(preds, axis=1))
+
+y_true = np.array(y_true)
+y_pred = np.array(y_pred)
+
+print(classification_report(y_true, y_pred, target_names=class_names))
+
+cm = confusion_matrix(y_true, y_pred)
+plt.figure(figsize=(20, 18))
+sns.heatmap(cm, annot=False, cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.title('Confusion Matrix - Plant Disease Classification')
+plt.xticks(rotation=90)
+plt.yticks(rotation=0)
+plt.savefig('confusion_matrix.png', dpi=150, bbox_inches='tight')
+plt.show()
